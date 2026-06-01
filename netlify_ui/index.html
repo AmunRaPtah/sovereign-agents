@@ -5,6 +5,7 @@
 <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0">
 <title>Sovereign Agents</title>
 <link rel="preconnect" href="https://fonts.googleapis.com">
+<script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
 <link href="https://fonts.googleapis.com/css2?family=Cormorant+Garamond:wght@300;400;500;600&family=JetBrains+Mono:wght@300;400;500&display=swap" rel="stylesheet">
 <style>
   /* ── TOKENS ──────────────────────────────────────────────────── */
@@ -509,6 +510,80 @@
     color: var(--text);
   }
 
+
+  /* ── MARKDOWN RENDER ─────────────────────────────────────────── */
+  .md-render h1,.md-render h2,.md-render h3 {
+    font-family: var(--font-serif);
+    font-weight: 500;
+    color: var(--accent);
+    margin: 18px 0 8px;
+    line-height: 1.2;
+  }
+  .md-render h1 { font-size: 20px; }
+  .md-render h2 { font-size: 17px; }
+  .md-render h3 { font-size: 15px; border-bottom: 1px solid var(--border); padding-bottom: 4px; }
+  .md-render p  { margin-bottom: 10px; }
+  .md-render ul, .md-render ol { padding-left: 20px; margin-bottom: 10px; }
+  .md-render li { margin-bottom: 4px; }
+  .md-render code {
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: 2px;
+    padding: 1px 5px;
+    font-family: var(--font-mono);
+    font-size: 11px;
+    color: var(--accent);
+  }
+  .md-render pre {
+    background: #050505;
+    border: 1px solid var(--border);
+    border-radius: var(--r);
+    padding: 12px;
+    overflow-x: auto;
+    margin-bottom: 12px;
+  }
+  .md-render pre code {
+    background: none;
+    border: none;
+    padding: 0;
+    color: #a8c4a2;
+    font-size: 12px;
+  }
+  .md-render table {
+    width: 100%;
+    border-collapse: collapse;
+    margin-bottom: 12px;
+    font-size: 11px;
+  }
+  .md-render th {
+    background: var(--surface);
+    border: 1px solid var(--border);
+    padding: 6px 10px;
+    text-align: left;
+    color: var(--accent);
+    letter-spacing: 0.06em;
+    text-transform: uppercase;
+    font-size: 10px;
+  }
+  .md-render td {
+    border: 1px solid var(--border);
+    padding: 6px 10px;
+    vertical-align: top;
+  }
+  .md-render strong { color: var(--text); font-weight: 500; }
+  .md-render em     { color: var(--muted); font-style: italic; }
+  .md-render blockquote {
+    border-left: 2px solid var(--accent);
+    padding-left: 12px;
+    margin: 10px 0;
+    color: var(--muted);
+  }
+  .md-render hr {
+    border: none;
+    border-top: 1px solid var(--border);
+    margin: 16px 0;
+  }
+
   /* ── SCROLLBAR ───────────────────────────────────────────────── */
   ::-webkit-scrollbar { width: 4px; }
   ::-webkit-scrollbar-track { background: transparent; }
@@ -669,7 +744,7 @@
       <div class="modal-title" id="modalTitle">Session Detail</div>
       <button class="modal-close" id="modalClose">✕</button>
     </div>
-    <div class="modal-body" id="modalBody"></div>
+    <div class="modal-body md-render" id="modalBody"></div>
   </div>
 </div>
 
@@ -857,10 +932,17 @@ function renderResult(data) {
         <span class="result-title">${formatName(data.config_name)}</span>
         <span class="badge ${badgeClass}">${badgeText}</span>
       </div>
-      <div class="result-body">${escHtml(data.final_output)}</div>
+      <div class="result-body md-render" id="resultBody"></div>
       ${turnsHtml}
     </div>`;
   panel.style.display = 'block';
+  // Render markdown in result body
+  const rb = document.getElementById('resultBody');
+  if (rb && typeof marked !== 'undefined') {
+    rb.innerHTML = marked.parse(data.final_output || '');
+  } else if (rb) {
+    rb.textContent = data.final_output || '';
+  }
   panel.scrollIntoView({ behavior: 'smooth', block: 'start' });
 }
 
@@ -923,7 +1005,12 @@ async function openSession(id) {
     const r = await fetch(`${MODAL_URL}/sessions/${id}`);
     const s = await r.json();
     document.getElementById('modalTitle').textContent = formatName(s.config_name);
-    document.getElementById('modalBody').textContent = s.final_output || 'No output.';
+    const mb = document.getElementById('modalBody');
+    if (typeof marked !== 'undefined') {
+      mb.innerHTML = marked.parse(s.final_output || 'No output.');
+    } else {
+      mb.textContent = s.final_output || 'No output.';
+    }
     document.getElementById('sessionModal').classList.add('open');
   } catch {}
 }
@@ -961,9 +1048,15 @@ document.getElementById('synthBtn').addEventListener('click', async () => {
           <span class="result-title">Synthesis: ${escHtml(topic)}</span>
           <span class="badge pending">${data.session_count} sessions</span>
         </div>
-        <div class="result-body">${escHtml(data.synthesis)}</div>
+        <div class="result-body md-render" id="synthBody"></div>
       </div>`;
     el.style.display = 'block';
+    const sb2 = document.getElementById('synthBody');
+    if (sb2 && typeof marked !== 'undefined') {
+      sb2.innerHTML = marked.parse(data.synthesis || '');
+    } else if (sb2) {
+      sb2.textContent = data.synthesis || '';
+    }
   } catch(e) {
     alert('Synthesis failed: ' + e.message);
   } finally {
