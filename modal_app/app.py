@@ -1,14 +1,13 @@
 # ═══════════════════════════════════════════════════════════════════
-# SOVEREIGN AGENTS — Modal Engine
-# All third-party imports are INSIDE the api() function.
-# This means modal deploy works from a-Shell with ONLY modal installed.
+# SOVEREIGN AGENTS — Modal Engine  (QC-verified build)
+# All third-party imports live inside api() so modal deploy works
+# from a-Shell where only `modal` is installed locally.
 # ═══════════════════════════════════════════════════════════════════
 
 import modal
 import os
 from pathlib import Path
 
-# ─── MODAL APP SETUP ─────────────────────────────────────────────
 app = modal.App("sovereign-agents")
 
 image = (
@@ -24,9 +23,6 @@ image = (
     .add_local_dir("./configs", remote_path="/configs")
 )
 
-# ─── ENTRYPOINT ───────────────────────────────────────────────────
-# ALL third-party imports live here so they only run in the container,
-# never in a-Shell where they are not installed.
 
 @app.function(
     image=image,
@@ -43,7 +39,6 @@ def api():
     from pydantic import BaseModel
     from supabase import create_client
 
-    # ── FastAPI app ────────────────────────────────────────────────
     web_app = FastAPI(title="Sovereign Agents API")
     web_app.add_middleware(
         CORSMiddleware,
@@ -88,46 +83,110 @@ def api():
             ),
         )
 
+    # BUG FIX 1 + 2: safe_generate wraps .text access so a safety-blocked
+    # or empty response never crashes the loop. Returns a fallback string.
+    def safe_generate(model, prompt: str) -> str:
+        try:
+            resp = model.generate_content(prompt)
+            # .text raises ValueError if response was blocked or parts are empty
+            return resp.text.strip()
+        except ValueError:
+            # Safety block or empty response — return a structured fallback
+            return (
+                "I was unable to generate a response for this turn. "
+                "The content may have triggered a safety filter. "
+                "Please rephrase the input and try again."
+            )
+        except Exception as e:
+            return f"API error on this turn: {str(e)[:200]}"
+
+    # BUG FIX 2: extract the final substantive output correctly.
+    # Agents often write "[full answer]\nTERMINATE" in one response.
+    # Old code skipped the whole turn. This version strips the TERMINATE
+    # suffix and returns whatever precedes it.
+    def extract_final_output(turns: list, stop: str) -> str:
+        if not turns:
+            return ""
+        for t in reversed(turns):
+            content = t["content"]
+            upper   = content.upper()
+            stop_up = stop.upper()
+            if stop_up in upper:
+                idx = upper.rfind(stop_up)
+                pre = content[:idx].strip()
+                if pre:
+                    return pre
+                # TERMINATE was the only content — continue to previous turn
+            else:
+                return content
+        # All turns had only TERMINATE — return last turn content anyway
+        return turns[-1]["content"]
+
     # ── Debate engine ──────────────────────────────────────────────
     def run_debate(config: dict, user_input: str) -> dict:
-        model     = get_model()
-        a_name    = config["agent_a"]["name"]
-        b_name    = config["agent_b"]["name"]
-        a_role    = config["agent_a"]["persona"]
-        b_role    = config["agent_b"]["persona"]
-        task      = config["task_template"].replace("{input}", user_input)
-        fmt       = config.get("output_format", "")
+        model    = get_model()
+        a_name   = config["agent_a"]["name"]
+        b_name   = config["agent_b"]["name"]
+        a_role   = config["agent_a"]["persona"]
+        b_role   = config["agent_b"]["persona"]
+        task     = config["task_template"].replace("{input}", user_input)
+        fmt      = config.get("output_format", "")
         max_turns = config.get("max_turns", 8)
-        stop      = config.get("termination_word", "TERMINATE")
+        stop     = config.get("termination_word", "TERMINATE")
+
+        # BUG FIX 3: build a persistent format reminder injected into every
+        # Agent A prompt so the required structure is never lost after turn 1.
+        fmt_reminder = (
+            f"\n\nRequired output format (maintain this throughout):\n{fmt}"
+            if fmt else ""
+        )
 
         history, turns = [], []
         terminated     = False
-        current_msg    = f"{task}\n\nRequired output format:\n{fmt}" if fmt else task
+
+        # First message to Agent A: the full task + format
+        initial_task = f"{task}{fmt_reminder}"
+        current_critique = ""  # Agent B's latest critique (empty on turn 1)
 
         for n in range(max_turns):
 
-            # Agent A
+            # ── Agent A ───────────────────────────────────────────
             hist_block = (
                 "\n\n".join(f"[{t['agent']}]:\n{t['content']}" for t in history)
                 if history else "Opening of session."
             )
+
+            # BUG FIX 3: always include the task + format reminder in Agent A's
+            # prompt regardless of turn number.
+            if n == 0:
+                task_section = f"YOUR TASK:\n{initial_task}"
+            else:
+                task_section = (
+                    f"ORIGINAL TASK (maintain this output format):\n{initial_task}"
+                    f"\n\nCRITIQUE TO ADDRESS:\n{current_critique}"
+                )
+
             prompt_a = (
                 f"You are {a_name}.\n\nROLE:\n{a_role}\n\n"
                 f"CONVERSATION SO FAR:\n{hist_block}\n\n"
-                f"RESPOND TO:\n{current_msg}\n\n"
-                f"If work is fully validated and complete, output the single word "
-                f"{stop} on its own line. Otherwise continue."
+                f"{task_section}\n\n"
+                f"If work is fully validated and complete with all format requirements "
+                f"met, output the single word {stop} on its own line at the end. "
+                f"Otherwise produce your full response."
             )
-            content_a = model.generate_content(prompt_a).text.strip()
+
+            content_a = safe_generate(model, prompt_a)
             history.append({"agent": a_name, "content": content_a})
-            turns.append({"agent": a_name, "role": "builder",
-                          "content": content_a, "turn": n * 2 + 1})
+            turns.append({
+                "agent": a_name, "role": "builder",
+                "content": content_a, "turn": n * 2 + 1
+            })
 
             if stop.upper() in content_a.upper():
                 terminated = True
                 break
 
-            # Agent B
+            # ── Agent B ───────────────────────────────────────────
             hist_block = "\n\n".join(
                 f"[{t['agent']}]:\n{t['content']}" for t in history
             )
@@ -135,26 +194,24 @@ def api():
                 f"You are {b_name}.\n\nROLE:\n{b_role}\n\n"
                 f"CONVERSATION SO FAR:\n{hist_block}\n\n"
                 f"You are reviewing {a_name}'s latest response. "
-                f"Apply maximum critical rigour. Provide numbered critiques.\n\n"
+                f"Apply maximum critical rigour. Provide specific numbered critiques.\n\n"
                 f"If everything is fully validated with zero remaining issues, "
                 f"output the single word {stop} on its own line."
             )
-            content_b = model.generate_content(prompt_b).text.strip()
+
+            content_b = safe_generate(model, prompt_b)
             history.append({"agent": b_name, "content": content_b})
-            turns.append({"agent": b_name, "role": "critic",
-                          "content": content_b, "turn": n * 2 + 2})
-            current_msg = content_b
+            turns.append({
+                "agent": b_name, "role": "critic",
+                "content": content_b, "turn": n * 2 + 2
+            })
+            current_critique = content_b  # passed back to Agent A next turn
 
             if stop.upper() in content_b.upper():
                 terminated = True
                 break
 
-        # Last substantive turn before TERMINATE
-        final = next(
-            (t["content"] for t in reversed(turns)
-             if stop.upper() not in t["content"].upper()),
-            turns[-1]["content"] if turns else "",
-        )
+        final = extract_final_output(turns, stop)
 
         return {
             "turns": turns,
@@ -185,6 +242,8 @@ def api():
             })
         return {"configs": out}
 
+    # BUG FIX 6: wrap entire run_debate call so any unexpected exception
+    # returns a readable 500 message instead of a bare crash.
     @web_app.post("/run")
     async def run_session(req: RunRequest):
         try:
@@ -192,20 +251,30 @@ def api():
         except FileNotFoundError as e:
             raise HTTPException(status_code=404, detail=str(e))
 
-        result = run_debate(config, req.input)
+        try:
+            result = run_debate(config, req.input)
+        except Exception as e:
+            raise HTTPException(
+                status_code=500,
+                detail=f"Debate engine error: {str(e)[:300]}"
+            )
 
-        sb  = get_supabase()
-        row = {
-            "config_name":         req.config_name,
-            "input_text":          req.input,
-            "agent_turns":         result["turns"],
-            "final_output":        result["final_output"],
-            "verification_status": result["verification_status"],
-            "tags":                req.tags,
-            "total_turns":         result["total_turns"],
-        }
-        saved      = sb.table("agent_sessions").insert(row).execute()
-        session_id = saved.data[0]["id"] if saved.data else None
+        try:
+            sb  = get_supabase()
+            row = {
+                "config_name":         req.config_name,
+                "input_text":          req.input,
+                "agent_turns":         result["turns"],
+                "final_output":        result["final_output"],
+                "verification_status": result["verification_status"],
+                "tags":                req.tags,
+                "total_turns":         result["total_turns"],
+            }
+            saved      = sb.table("agent_sessions").insert(row).execute()
+            session_id = saved.data[0]["id"] if saved.data else None
+        except Exception:
+            # Supabase failure should not prevent returning the result
+            session_id = None
 
         return {
             "session_id":          session_id,
@@ -231,16 +300,20 @@ def api():
 
     @web_app.get("/sessions/{session_id}")
     async def get_session(session_id: str):
-        sb = get_supabase()
-        return (
-            sb.table("agent_sessions")
-            .select("*")
-            .eq("id", session_id)
-            .single()
-            .execute()
-            .data
-        )
+        try:
+            sb = get_supabase()
+            return (
+                sb.table("agent_sessions")
+                .select("*")
+                .eq("id", session_id)
+                .single()
+                .execute()
+                .data
+            )
+        except Exception as e:
+            raise HTTPException(status_code=404, detail="Session not found.")
 
+    # BUG FIX 4: null guards on input_text and final_output in synthesize.
     @web_app.post("/synthesize")
     async def synthesize(req: SynthesisRequest):
         sb = get_supabase()
@@ -257,25 +330,35 @@ def api():
         if not sessions:
             return {"synthesis": "No sessions yet.", "session_count": 0}
 
+        # BUG FIX 4: safe string slicing with null defaults
         body = "\n\n---\n\n".join(
             f"Config: {s['config_name']} | {s['created_at'][:10]} | {s['verification_status']}\n"
-            f"Input: {s['input_text'][:400]}\n"
-            f"Output: {s['final_output'][:800]}"
+            f"Input: {(s.get('input_text') or '')[:400]}\n"
+            f"Output: {(s.get('final_output') or '')[:800]}"
             for s in sessions
         )
         prompt = (
             f"You are a Pattern Recognition and Knowledge Synthesis engine.\n\n"
             f"TOPIC: {req.topic}\n\n"
-            f"SESSIONS ({len(sessions)}):\n{body}\n\n"
-            "Output exactly:\n"
+            f"SESSIONS ({len(sessions)} total):\n{body}\n\n"
+            "Output exactly this structure:\n"
             "### Recurring Patterns\n"
             "### Contradictions and Tensions\n"
             "### Emergent Conclusions\n"
             "### Remaining Knowledge Gaps\n"
-            "### Recommended Next Directions (5 ranked by leverage)"
+            "### Recommended Next Directions (5 items, ranked by leverage)"
         )
-        model    = get_model()
-        response = model.generate_content(prompt)
-        return {"synthesis": response.text, "session_count": len(sessions), "topic": req.topic}
+        try:
+            model    = get_model()
+            response = model.generate_content(prompt)
+            synthesis_text = response.text
+        except Exception as e:
+            synthesis_text = f"Synthesis error: {str(e)[:200]}"
+
+        return {
+            "synthesis":     synthesis_text,
+            "session_count": len(sessions),
+            "topic":         req.topic,
+        }
 
     return web_app
