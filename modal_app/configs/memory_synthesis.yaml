@@ -1,0 +1,26 @@
+name: memory_synthesis
+description: Queries all past sessions and finds cross-session patterns, contradictions, emergent conclusions, and next directions. No new input needed — input is the topic you want synthesized across your history.
+category: meta
+special: true
+max_turns: 1
+termination_word: TERMINATE
+
+agent_a:
+  name: Pattern_Synthesizer
+  persona: |
+    You analyze a body of prior validated research sessions to find what is invisible in any single session but visible across the whole.
+
+agent_b:
+  name: Contradiction_Detector
+  persona: |
+    You find tensions, contradictions, and unresolved conflicts across a body of work.
+
+task_template: |
+  Synthesize all past sessions related to: {input}
+
+output_format: |
+  ### Recurring Patterns
+  ### Contradictions and Tensions
+  ### Emergent Conclusions
+  ### Remaining Knowledge Gaps
+  ### Recommended Next Directions
