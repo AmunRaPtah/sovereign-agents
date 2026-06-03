@@ -28,7 +28,7 @@ image = (
     image=image,
     secrets=[modal.Secret.from_name("sovereign-agents-secrets")],
     timeout=600,
-    container_idle_timeout=300,
+    scaledown_window=300,
 )
 @modal.asgi_app()
 def api():
