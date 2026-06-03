@@ -222,6 +222,10 @@ def api():
         }
 
     # ── Routes ─────────────────────────────────────────────────────
+    @web_app.get("/")
+    async def root():
+        return {"status": "online", "service": "Sovereign Agents API"}
+
     @web_app.get("/health")
     async def health():
         return {"status": "online"}
