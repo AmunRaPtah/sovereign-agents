@@ -34,7 +34,7 @@ image = (
 def api():
     import yaml
     import google.generativeai as genai
-    from fastapi import FastAPI, HTTPException
+    from fastapi import FastAPI, HTTPException, BackgroundTasks
     from fastapi.middleware.cors import CORSMiddleware
     from pydantic import BaseModel
     from supabase import create_client
@@ -125,10 +125,6 @@ def api():
                 return safe_generate_mistral(prompt)
             return f"API error on this turn: {err[:200]}"
 
-    # BUG FIX 2: extract the final substantive output correctly.
-    # Agents often write "[full answer]\nTERMINATE" in one response.
-    # Old code skipped the whole turn. This version strips the TERMINATE
-    # suffix and returns whatever precedes it.
     def extract_final_output(turns: list, stop: str) -> str:
         if not turns:
             return ""
@@ -141,10 +137,8 @@ def api():
                 pre = content[:idx].strip()
                 if pre:
                     return pre
-                # TERMINATE was the only content — continue to previous turn
             else:
                 return content
-        # All turns had only TERMINATE — return last turn content anyway
         return turns[-1]["content"]
 
     # ── Debate engine ──────────────────────────────────────────────
@@ -159,8 +153,6 @@ def api():
         max_turns = config.get("max_turns", 8)
         stop     = config.get("termination_word", "TERMINATE")
 
-        # BUG FIX 3: build a persistent format reminder injected into every
-        # Agent A prompt so the required structure is never lost after turn 1.
         fmt_reminder = (
             f"\n\nRequired output format (maintain this throughout):\n{fmt}"
             if fmt else ""
@@ -169,20 +161,16 @@ def api():
         history, turns = [], []
         terminated     = False
 
-        # First message to Agent A: the full task + format
         initial_task = f"{task}{fmt_reminder}"
-        current_critique = ""  # Agent B's latest critique (empty on turn 1)
+        current_critique = ""
 
         for n in range(max_turns):
 
-            # ── Agent A ───────────────────────────────────────────
             hist_block = (
                 "\n\n".join(f"[{t['agent']}]:\n{t['content']}" for t in history)
                 if history else "Opening of session."
             )
 
-            # BUG FIX 3: always include the task + format reminder in Agent A's
-            # prompt regardless of turn number.
             if n == 0:
                 task_section = f"YOUR TASK:\n{initial_task}"
             else:
@@ -211,7 +199,6 @@ def api():
                 terminated = True
                 break
 
-            # ── Agent B ───────────────────────────────────────────
             hist_block = "\n\n".join(
                 f"[{t['agent']}]:\n{t['content']}" for t in history
             )
@@ -230,7 +217,7 @@ def api():
                 "agent": b_name, "role": "critic",
                 "content": content_b, "turn": n * 2 + 2
             })
-            current_critique = content_b  # passed back to Agent A next turn
+            current_critique = content_b
 
             if stop.upper() in content_b.upper():
                 terminated = True
@@ -245,6 +232,26 @@ def api():
             "total_turns": len(turns),
             "verification_status": "VERIFIED" if terminated else "MAX_TURNS_REACHED",
         }
+
+    # ── Background task: runs debate and updates Supabase row ──────
+    def _run_and_save(config: dict, user_input: str, session_id: str, tags: list):
+        try:
+            result = run_debate(config, user_input)
+            get_supabase().table("agent_sessions").update({
+                "agent_turns":         result["turns"],
+                "final_output":        result["final_output"],
+                "verification_status": result["verification_status"],
+                "total_turns":         result["total_turns"],
+            }).eq("id", session_id).execute()
+        except Exception as e:
+            try:
+                get_supabase().table("agent_sessions").update({
+                    "verification_status": "ERROR",
+                    "final_output":        f"Engine error: {str(e)[:300]}",
+                    "total_turns":         0,
+                }).eq("id", session_id).execute()
+            except Exception:
+                pass
 
     # ── Routes ─────────────────────────────────────────────────────
     @web_app.get("/")
@@ -271,48 +278,33 @@ def api():
             })
         return {"configs": out}
 
-    # BUG FIX 6: wrap entire run_debate call so any unexpected exception
-    # returns a readable 500 message instead of a bare crash.
+    # Fire-and-forget: inserts a PENDING row immediately, runs debate
+    # in a FastAPI background task so the mobile connection never hangs.
     @web_app.post("/run")
-    async def run_session(req: RunRequest):
+    async def run_session(req: RunRequest, background_tasks: BackgroundTasks):
         try:
             config = load_config(req.config_name)
         except FileNotFoundError as e:
             raise HTTPException(status_code=404, detail=str(e))
 
         try:
-            result = run_debate(config, req.input)
-        except Exception as e:
-            raise HTTPException(
-                status_code=500,
-                detail=f"Debate engine error: {str(e)[:300]}"
-            )
-
-        try:
             sb  = get_supabase()
-            row = {
+            row = sb.table("agent_sessions").insert({
                 "config_name":         req.config_name,
                 "input_text":          req.input,
-                "agent_turns":         result["turns"],
-                "final_output":        result["final_output"],
-                "verification_status": result["verification_status"],
                 "tags":                req.tags,
-                "total_turns":         result["total_turns"],
-            }
-            saved      = sb.table("agent_sessions").insert(row).execute()
-            session_id = saved.data[0]["id"] if saved.data else None
-        except Exception:
-            # Supabase failure should not prevent returning the result
-            session_id = None
+                "verification_status": "PENDING",
+                "final_output":        "",
+                "agent_turns":         [],
+                "total_turns":         0,
+            }).execute()
+            session_id = row.data[0]["id"]
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=f"Session init failed: {str(e)[:200]}")
 
-        return {
-            "session_id":          session_id,
-            "config_name":         req.config_name,
-            "final_output":        result["final_output"],
-            "turns":               result["turns"],
-            "verification_status": result["verification_status"],
-            "total_turns":         result["total_turns"],
-        }
+        background_tasks.add_task(_run_and_save, config, req.input, session_id, req.tags)
+
+        return {"session_id": session_id, "status": "pending"}
 
     @web_app.get("/sessions")
     async def get_sessions(config_name: str = None, limit: int = 30):
@@ -342,7 +334,6 @@ def api():
         except Exception as e:
             raise HTTPException(status_code=404, detail="Session not found.")
 
-    # BUG FIX 4: null guards on input_text and final_output in synthesize.
     @web_app.post("/synthesize")
     async def synthesize(req: SynthesisRequest):
         sb = get_supabase()
@@ -359,7 +350,6 @@ def api():
         if not sessions:
             return {"synthesis": "No sessions yet.", "session_count": 0}
 
-        # BUG FIX 4: safe string slicing with null defaults
         body = "\n\n---\n\n".join(
             f"Config: {s['config_name']} | {s['created_at'][:10]} | {s['verification_status']}\n"
             f"Input: {(s.get('input_text') or '')[:400]}\n"
