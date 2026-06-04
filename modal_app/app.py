@@ -83,22 +83,47 @@ def api():
             ),
         )
 
-    # BUG FIX 1 + 2: safe_generate wraps .text access so a safety-blocked
-    # or empty response never crashes the loop. Returns a fallback string.
+    # safe_generate: Gemini primary, Mistral fallback on 429/quota errors.
+    def safe_generate_mistral(prompt: str) -> str:
+        mistral_key = os.environ.get("MISTRAL_API_KEY", "")
+        if not mistral_key:
+            return "Mistral fallback unavailable: MISTRAL_API_KEY not set in Modal secrets."
+        try:
+            import httpx
+            resp = httpx.post(
+                "https://api.mistral.ai/v1/chat/completions",
+                headers={
+                    "Authorization": f"Bearer {mistral_key}",
+                    "Content-Type": "application/json",
+                },
+                json={
+                    "model": "mistral-small-latest",
+                    "messages": [{"role": "user", "content": prompt}],
+                    "max_tokens": 2048,
+                    "temperature": 0.7,
+                },
+                timeout=120.0,
+            )
+            resp.raise_for_status()
+            return resp.json()["choices"][0]["message"]["content"].strip()
+        except Exception as e:
+            return f"Mistral fallback error: {str(e)[:200]}"
+
     def safe_generate(model, prompt: str) -> str:
         try:
             resp = model.generate_content(prompt)
-            # .text raises ValueError if response was blocked or parts are empty
             return resp.text.strip()
         except ValueError:
-            # Safety block or empty response — return a structured fallback
             return (
                 "I was unable to generate a response for this turn. "
                 "The content may have triggered a safety filter. "
                 "Please rephrase the input and try again."
             )
         except Exception as e:
-            return f"API error on this turn: {str(e)[:200]}"
+            err = str(e)
+            if "429" in err or "quota" in err.lower() or "ResourceExhausted" in err:
+                return safe_generate_mistral(prompt)
+            return f"API error on this turn: {err[:200]}"
 
     # BUG FIX 2: extract the final substantive output correctly.
     # Agents often write "[full answer]\nTERMINATE" in one response.
