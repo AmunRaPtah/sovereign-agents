@@ -879,14 +879,57 @@ document.getElementById('runBtn').addEventListener('click', async () => {
     });
     if (!r.ok) throw new Error(`Server error ${r.status}`);
     const data = await r.json();
-    renderResult(data);
-    await loadHistory();
+    if (data.status === 'pending' && data.session_id) {
+      await pollSession(data.session_id);
+    } else {
+      renderResult(data);
+      await loadHistory();
+      setRunning(false);
+    }
   } catch(e) {
     showError(e.message);
-  } finally {
     setRunning(false);
   }
 });
+
+// ── POLL SESSION ──────────────────────────────────────────────────
+async function pollSession(sessionId) {
+  const maxWait = 6 * 60 * 1000; // 6 minutes
+  const pollInterval = 4000;     // 4 seconds
+  const start = Date.now();
+  let tick = 0;
+  const labels = ['Agents debating.', 'Agents debating..', 'Agents debating...', 'Agents debating....'];
+
+  while (Date.now() - start < maxWait) {
+    await new Promise(res => setTimeout(res, pollInterval));
+    document.getElementById('runStatusLabel').textContent = labels[tick % labels.length];
+    tick++;
+
+    try {
+      const r = await fetch(`${MODAL_URL}/sessions/${sessionId}`);
+      if (!r.ok) continue;
+      const s = await r.json();
+      if (s.verification_status && s.verification_status !== 'PENDING') {
+        renderResult({
+          session_id:          s.id,
+          config_name:         s.config_name,
+          final_output:        s.final_output,
+          turns:               s.agent_turns || [],
+          verification_status: s.verification_status,
+          total_turns:         s.total_turns,
+        });
+        await loadHistory();
+        setRunning(false);
+        return;
+      }
+    } catch (_) {
+      // transient poll failure, keep trying
+    }
+  }
+
+  showError('Debate is running longer than expected. Check the History tab in a few minutes.');
+  setRunning(false);
+}
 
 function setRunning(state) {
   document.getElementById('runBtn').disabled = state;
@@ -1094,3 +1137,4 @@ init();
 </script>
 </body>
 </html>
+
