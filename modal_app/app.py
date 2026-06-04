@@ -33,7 +33,6 @@ image = (
 @modal.asgi_app()
 def api():
     import yaml
-    import google.generativeai as genai
     from fastapi import FastAPI, HTTPException, BackgroundTasks
     from fastapi.middleware.cors import CORSMiddleware
     from pydantic import BaseModel
@@ -73,57 +72,45 @@ def api():
         with open(p) as f:
             return yaml.safe_load(f)
 
-    def get_model():
-        genai.configure(api_key=os.environ["GEMINI_API_KEY"])
-        return genai.GenerativeModel(
-            "gemini-2.0-flash",
-            generation_config=genai.GenerationConfig(
-                temperature=0.7,
-                max_output_tokens=2048,
-            ),
+    # Groq primary (llama-3.3-70b), Mistral fallback
+    def _call_groq(prompt: str) -> str:
+        from groq import Groq
+        client = Groq(api_key=os.environ["GROQ_API_KEY"])
+        resp = client.chat.completions.create(
+            model="llama-3.3-70b-versatile",
+            messages=[{"role": "user", "content": prompt}],
+            max_tokens=2048,
+            temperature=0.7,
         )
+        return resp.choices[0].message.content.strip()
 
-    # safe_generate: Gemini primary, Mistral fallback on 429/quota errors.
-    def safe_generate_mistral(prompt: str) -> str:
+    def _call_mistral(prompt: str) -> str:
+        import httpx
         mistral_key = os.environ.get("MISTRAL_API_KEY", "")
         if not mistral_key:
-            return "Mistral fallback unavailable: MISTRAL_API_KEY not set in Modal secrets."
-        try:
-            import httpx
-            resp = httpx.post(
-                "https://api.mistral.ai/v1/chat/completions",
-                headers={
-                    "Authorization": f"Bearer {mistral_key}",
-                    "Content-Type": "application/json",
-                },
-                json={
-                    "model": "mistral-small-latest",
-                    "messages": [{"role": "user", "content": prompt}],
-                    "max_tokens": 2048,
-                    "temperature": 0.7,
-                },
-                timeout=120.0,
-            )
-            resp.raise_for_status()
-            return resp.json()["choices"][0]["message"]["content"].strip()
-        except Exception as e:
-            return f"Mistral fallback error: {str(e)[:200]}"
+            raise RuntimeError("MISTRAL_API_KEY not set")
+        resp = httpx.post(
+            "https://api.mistral.ai/v1/chat/completions",
+            headers={"Authorization": f"Bearer {mistral_key}", "Content-Type": "application/json"},
+            json={"model": "mistral-small-latest", "messages": [{"role": "user", "content": prompt}],
+                  "max_tokens": 2048, "temperature": 0.7},
+            timeout=120.0,
+        )
+        resp.raise_for_status()
+        return resp.json()["choices"][0]["message"]["content"].strip()
 
     def safe_generate(model, prompt: str) -> str:
+        # model param kept for signature compatibility, not used
         try:
-            resp = model.generate_content(prompt)
-            return resp.text.strip()
-        except ValueError:
-            return (
-                "I was unable to generate a response for this turn. "
-                "The content may have triggered a safety filter. "
-                "Please rephrase the input and try again."
-            )
-        except Exception as e:
-            err = str(e)
-            if "429" in err or "quota" in err.lower() or "ResourceExhausted" in err:
-                return safe_generate_mistral(prompt)
-            return f"API error on this turn: {err[:200]}"
+            return _call_groq(prompt)
+        except Exception as e1:
+            try:
+                return _call_mistral(prompt)
+            except Exception as e2:
+                return f"Both providers failed. Groq: {str(e1)[:120]} | Mistral: {str(e2)[:120]}"
+
+    def get_model():
+        return None  # unused; safe_generate handles providers directly
 
     def extract_final_output(turns: list, stop: str) -> str:
         if not turns:
